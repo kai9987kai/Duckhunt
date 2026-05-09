@@ -2,20 +2,27 @@
 
 ## Supported Versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+DuckHunter is maintained from the repository's default branch. Historical
+binary builds are provided as convenience artifacts and should be treated as
+legacy unless rebuilt from the current source.
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+| Current source | :white_check_mark: |
+| Bundled 0.9 builds | :x: |
 
 ## Reporting a Vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please avoid posting working exploit payloads publicly before there has been
+time to investigate. Report issues through GitHub security advisories if
+available for the repository, or open a GitHub issue with enough detail to
+reproduce the defensive failure without including sensitive data.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+Useful reports include:
+
+- Windows version and Python version.
+- Whether `pyHook` or `pyWinhook` is being used.
+- Relevant `duckhunt.conf` settings.
+- A minimal description of the HID-injection behavior, timing, and target
+  window.
+- The structured intrusion log line with secrets removed.

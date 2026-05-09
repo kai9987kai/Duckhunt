@@ -11,9 +11,11 @@ This script monitors keyboard input to detect potential keystroke injection atta
 MIT License
 """
 
+import importlib.machinery
 import importlib.util
 import json
 import logging
+import math
 import os
 import statistics
 import sys
@@ -47,7 +49,8 @@ WM_QUIT = 0x0012
 
 
 def load_config(config_path='duckhunt.conf'):
-    spec = importlib.util.spec_from_file_location("duckhunt", config_path)
+    loader = importlib.machinery.SourceFileLoader("duckhunt_config", config_path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
     return config_module
@@ -150,6 +153,27 @@ def parse_window_threshold_overrides(value):
     return overrides
 
 
+def normalize_command_fragment(value):
+    return " ".join(str(value or "").lower().split())
+
+
+def parse_command_fragments(value):
+    fragments = []
+    if value is None:
+        return fragments
+
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = str(value).split(";")
+
+    for item in raw_items:
+        fragment = normalize_command_fragment(item)
+        if fragment:
+            fragments.append(fragment)
+    return fragments
+
+
 def show_system_message(title, body):
     try:
         windll.user32.MessageBoxW(0, body, title, 0x00001000)
@@ -186,6 +210,30 @@ def configure_logging(filename, level_name, max_bytes, backup_count):
 
 config = load_config()
 
+DEFAULT_COMMAND_FRAGMENT_SIGNATURES = (
+    "powershell -enc",
+    "powershell /enc",
+    "encodedcommand",
+    "frombase64string",
+    "invoke-webrequest",
+    "downloadstring",
+    "start-process",
+    "cmd.exe /c",
+    "curl http",
+    "iwr http",
+    "irm http",
+    "certutil",
+    "bitsadmin",
+    "mshta",
+    "rundll32",
+    "reg add",
+    "schtasks",
+    "net user",
+    "add-mppreference",
+    "set-mppreference",
+)
+DEFAULT_SENSITIVE_WINDOWS = "command prompt,windows powershell,powershell,terminal,cmd.exe,run,registry editor"
+
 THRESHOLD = as_int(getattr(config, "threshold", 30), 30, minimum=1)
 HISTORY_SIZE = as_int(getattr(config, "size", 25), 25, minimum=3)
 POLICY = normalize_policy(getattr(config, "policy", "normal"))
@@ -207,6 +255,16 @@ INJECTED_BURST_COUNT = as_int(getattr(config, "injected_burst_count", 0), 0, min
 # Optional signature + adaptive detection
 PATTERN_SIGNATURES = parse_pattern_signatures(getattr(config, "pattern_signatures", ""))
 KEY_BUFFER_SIZE = as_int(getattr(config, "key_buffer_size", 18), 18, minimum=4)
+COMMAND_FRAGMENT_DETECTION = as_bool(getattr(config, "command_fragment_detection", True), default=True)
+COMMAND_FRAGMENT_SIGNATURES = parse_command_fragments(
+    getattr(config, "command_fragment_signatures", DEFAULT_COMMAND_FRAGMENT_SIGNATURES)
+)
+COMMAND_FRAGMENT_BUFFER_SIZE = as_int(getattr(config, "command_fragment_buffer_size", 220), 220, minimum=40)
+RISK_SCORE_ENABLED = as_bool(getattr(config, "risk_score_enabled", True), default=True)
+RISK_SCORE_THRESHOLD = as_int(getattr(config, "risk_score_threshold", 80), 80, minimum=1)
+SENSITIVE_WINDOWS = [
+    item.lower() for item in as_csv_list(getattr(config, "sensitive_windows", DEFAULT_SENSITIVE_WINDOWS))
+]
 ADAPTIVE_THRESHOLD_ENABLED = as_bool(getattr(config, "adaptive_threshold_enabled", False), default=False)
 ADAPTIVE_MIN_SAMPLES = as_int(getattr(config, "adaptive_min_samples", 40), 40, minimum=5)
 ADAPTIVE_SAMPLE_SIZE = as_int(getattr(config, "adaptive_sample_size", 140), 140, minimum=ADAPTIVE_MIN_SAMPLES)
@@ -221,12 +279,39 @@ LOW_VARIANCE_STDDEV_MS = as_float(getattr(config, "low_variance_stddev_ms", 2.5)
 LOW_VARIANCE_SPEED_CEILING_MS = as_int(getattr(config, "low_variance_speed_ceiling_ms", 55), 55, minimum=1)
 LOW_VARIANCE_STREAK_COUNT = as_int(getattr(config, "low_variance_streak_count", 6), 6, minimum=1)
 
+# Timing entropy catches highly repetitive cadence even when basic stddev checks miss it.
+TIMING_ENTROPY_DETECTION = as_bool(getattr(config, "timing_entropy_detection", True), default=True)
+TIMING_ENTROPY_WINDOW = as_int(getattr(config, "timing_entropy_window", 12), 12, minimum=4)
+TIMING_ENTROPY_MIN_SAMPLES = min(
+    TIMING_ENTROPY_WINDOW,
+    as_int(getattr(config, "timing_entropy_min_samples", 10), 10, minimum=4),
+)
+TIMING_ENTROPY_BIN_MS = as_int(getattr(config, "timing_entropy_bin_ms", 5), 5, minimum=1)
+TIMING_ENTROPY_THRESHOLD = as_float(getattr(config, "timing_entropy_threshold", 1.25), 1.25, minimum=0.0)
+TIMING_ENTROPY_SPEED_CEILING_MS = as_int(getattr(config, "timing_entropy_speed_ceiling_ms", 90), 90, minimum=1)
+TIMING_ENTROPY_STREAK_COUNT = as_int(getattr(config, "timing_entropy_streak_count", 2), 2, minimum=1)
+
 # Optional runtime status export and temporary pause controls
 STATUS_FILENAME = str(getattr(config, "status_filename", ""))
 STATUS_FLUSH_INTERVAL = as_int(getattr(config, "status_flush_interval", 250), 250, minimum=1)
 PAUSE_DURATION_MS = as_int(getattr(config, "pause_duration_ms", 30000), 30000, minimum=1000)
+INCIDENT_JSON_FILENAME = str(getattr(config, "incident_json_filename", "")).strip()
+INCIDENT_JSON_INCLUDE_WINDOW = as_bool(getattr(config, "incident_json_include_window", True), default=True)
 LOG_MAX_BYTES = as_int(getattr(config, "log_max_bytes", 1048576), 1048576, minimum=0)
 LOG_BACKUP_COUNT = as_int(getattr(config, "log_backup_count", 5), 5, minimum=1)
+
+NORMAL_LOCKOUT_BACKOFF_ENABLED = as_bool(getattr(config, "normal_lockout_backoff_enabled", True), default=True)
+NORMAL_LOCKOUT_BACKOFF_WINDOW_MS = as_int(
+    getattr(config, "normal_lockout_backoff_window_ms", 10000), 10000, minimum=100
+)
+NORMAL_LOCKOUT_BACKOFF_MULTIPLIER = as_float(
+    getattr(config, "normal_lockout_backoff_multiplier", 1.6), 1.6, minimum=1.0
+)
+NORMAL_LOCKOUT_MAX_MS = as_int(getattr(config, "normal_lockout_max_ms", 8000), 8000, minimum=NORMAL_LOCKOUT_MS)
+
+RISK_SESSION_ENABLED = as_bool(getattr(config, "risk_session_enabled", True), default=True)
+RISK_SESSION_WINDOW_MS = as_int(getattr(config, "risk_session_window_ms", 1800), 1800, minimum=100)
+RISK_SESSION_THRESHOLD = as_int(getattr(config, "risk_session_threshold", 130), 130, minimum=1)
 
 # Warmup mode: avoid blocking on speed heuristics during startup calibration.
 WARMUP_EVENTS = as_int(getattr(config, "warmup_events", 0), 0, minimum=0)
@@ -294,6 +379,13 @@ class DuckHunterHook:
         self.injected_burst_count = INJECTED_BURST_COUNT
         self.pattern_signatures = PATTERN_SIGNATURES
         self.key_buffer = deque(maxlen=KEY_BUFFER_SIZE)
+        self.command_fragment_detection = COMMAND_FRAGMENT_DETECTION
+        self.command_fragment_signatures = COMMAND_FRAGMENT_SIGNATURES
+        self.command_fragment_buffer = deque(maxlen=COMMAND_FRAGMENT_BUFFER_SIZE)
+        self.command_context_window = ""
+        self.risk_score_enabled = RISK_SCORE_ENABLED
+        self.risk_score_threshold = RISK_SCORE_THRESHOLD
+        self.sensitive_windows = SENSITIVE_WINDOWS
         self.window_threshold_overrides = WINDOW_THRESHOLD_OVERRIDES
 
         self.adaptive_threshold_enabled = ADAPTIVE_THRESHOLD_ENABLED
@@ -309,10 +401,28 @@ class DuckHunterHook:
         self.low_variance_stddev = LOW_VARIANCE_STDDEV_MS
         self.low_variance_speed_ceiling = LOW_VARIANCE_SPEED_CEILING_MS
         self.low_variance_streak_count = LOW_VARIANCE_STREAK_COUNT
+        self.timing_entropy_detection = TIMING_ENTROPY_DETECTION
+        self.timing_entropy_min_samples = TIMING_ENTROPY_MIN_SAMPLES
+        self.timing_entropy_bin_ms = TIMING_ENTROPY_BIN_MS
+        self.timing_entropy_threshold = TIMING_ENTROPY_THRESHOLD
+        self.timing_entropy_speed_ceiling = TIMING_ENTROPY_SPEED_CEILING_MS
+        self.timing_entropy_streak_count = TIMING_ENTROPY_STREAK_COUNT
+        self.entropy_intervals = deque(maxlen=TIMING_ENTROPY_WINDOW)
+        self.timing_entropy = 0.0
 
         self.status_filename = STATUS_FILENAME.strip()
         self.status_flush_interval = STATUS_FLUSH_INTERVAL
         self.pause_duration_ms = PAUSE_DURATION_MS
+        self.incident_json_filename = INCIDENT_JSON_FILENAME
+        self.incident_json_include_window = INCIDENT_JSON_INCLUDE_WINDOW
+        self.normal_lockout_backoff_enabled = NORMAL_LOCKOUT_BACKOFF_ENABLED
+        self.normal_lockout_backoff_window_ms = NORMAL_LOCKOUT_BACKOFF_WINDOW_MS
+        self.normal_lockout_backoff_multiplier = NORMAL_LOCKOUT_BACKOFF_MULTIPLIER
+        self.normal_lockout_max_ms = NORMAL_LOCKOUT_MAX_MS
+        self.risk_session_enabled = RISK_SESSION_ENABLED
+        self.risk_session_window_ms = RISK_SESSION_WINDOW_MS
+        self.risk_session_threshold = RISK_SESSION_THRESHOLD
+        self.risk_events = deque()
         self.pause_until = 0
         self.events_since_flush = 0
         self.warmup_events = WARMUP_EVENTS
@@ -322,6 +432,7 @@ class DuckHunterHook:
 
         self.history = [self.threshold + 1] * self.history_size
         self.history_index = 0
+        self.interval_count = 0
         self.history_total = float(sum(self.history))
         self.history_square_total = float(sum(value * value for value in self.history))
         self.average_speed = self.history_total / self.history_size
@@ -333,9 +444,12 @@ class DuckHunterHook:
         self.randdrop_counter = 0
         self.last_window = ""
         self.normal_block_until = 0
+        self.current_normal_lockout_ms = self.normal_lockout_ms
+        self.recent_intrusion_times = deque()
         self.rapid_burst_counter = 0
         self.injected_burst_counter = 0
         self.low_variance_counter = 0
+        self.low_entropy_counter = 0
 
         self.total_events = 0
         self.allowed_events = 0
@@ -345,6 +459,10 @@ class DuckHunterHook:
         self.last_intrusion_window = ""
         self.last_intrusion_key = ""
         self.last_intrusion_at_ms = 0
+        self.last_risk_score = 0
+        self.last_risk_reasons = []
+        self.last_risk_session_score = 0
+        self.last_risk_session_reasons = []
 
         self.thread_id = None
         self.running = False
@@ -364,6 +482,10 @@ class DuckHunterHook:
         lowered = (window_name or "").lower()
         return any(token in lowered for token in self.blacklist)
 
+    def is_sensitive_window(self, window_name):
+        lowered = (window_name or "").lower()
+        return any(token in lowered for token in self.sensitive_windows)
+
     def get_window_threshold_override(self, window_name):
         lowered = (window_name or "").lower()
         for token, threshold in self.window_threshold_overrides:
@@ -372,6 +494,7 @@ class DuckHunterHook:
         return None
 
     def update_interval_metrics(self, interval):
+        self.interval_count += 1
         old_value = self.history[self.history_index]
         self.history[self.history_index] = interval
         self.history_index = (self.history_index + 1) % self.history_size
@@ -383,6 +506,34 @@ class DuckHunterHook:
         if variance < 0:
             variance = 0
         self.interval_stddev = variance ** 0.5
+
+    def update_entropy_metrics(self, interval):
+        if not self.timing_entropy_detection or interval <= 0:
+            return
+
+        self.entropy_intervals.append(interval)
+        if len(self.entropy_intervals) < self.timing_entropy_min_samples:
+            self.timing_entropy = 0.0
+            self.low_entropy_counter = 0
+            return
+
+        bins = {}
+        for value in self.entropy_intervals:
+            bucket = int(value / float(self.timing_entropy_bin_ms))
+            bins[bucket] = bins.get(bucket, 0) + 1
+
+        total = float(len(self.entropy_intervals))
+        entropy = 0.0
+        for count in bins.values():
+            probability = count / total
+            entropy -= probability * math.log(probability, 2)
+
+        self.timing_entropy = entropy
+        recent_median = statistics.median(self.entropy_intervals)
+        if recent_median <= self.timing_entropy_speed_ceiling and entropy <= self.timing_entropy_threshold:
+            self.low_entropy_counter += 1
+        else:
+            self.low_entropy_counter = 0
 
     def compute_effective_threshold(self):
         if not self.adaptive_threshold_enabled:
@@ -425,7 +576,9 @@ class DuckHunterHook:
         logging.warning(
             "Intrusion detected reason=%s policy=%s avg_interval_ms=%.2f threshold_ms=%d "
             "effective_threshold_ms=%d active_threshold_ms=%d stddev_ms=%.2f "
-            "rapid_streak=%d injected_streak=%d low_variance_streak=%d window=%r key=%r injected=%r",
+            "rapid_streak=%d injected_streak=%d low_variance_streak=%d "
+            "entropy=%.3f low_entropy_streak=%d risk_score=%d session_risk_score=%d "
+            "risk_reasons=%s normal_lockout_ms=%d window=%r key=%r injected=%r",
             reason,
             self.policy,
             self.average_speed,
@@ -436,6 +589,12 @@ class DuckHunterHook:
             self.rapid_burst_counter,
             self.injected_burst_counter,
             self.low_variance_counter,
+            self.timing_entropy,
+            self.low_entropy_counter,
+            self.last_risk_score,
+            self.last_risk_session_score,
+            "|".join(self.last_risk_reasons),
+            self.current_normal_lockout_ms,
             event.WindowName,
             event.Key,
             event.Injected,
@@ -452,6 +611,147 @@ class DuckHunterHook:
                 return "pattern_match:{}".format("->".join(signature))
         return ""
 
+    def update_command_context(self, event):
+        if not self.command_fragment_detection:
+            return
+
+        window_name = (getattr(event, "WindowName", "") or "").lower()
+        if window_name != self.command_context_window:
+            self.command_fragment_buffer.clear()
+            self.command_context_window = window_name
+
+        key_name = normalize_key_name(getattr(event, "Key", ""))
+        ascii_code = getattr(event, "Ascii", 0)
+        try:
+            ascii_code = int(ascii_code)
+        except (TypeError, ValueError):
+            ascii_code = 0
+
+        if 32 <= ascii_code < 127:
+            self.command_fragment_buffer.append(chr(ascii_code).lower())
+        elif key_name in ("RETURN", "ENTER", "TAB"):
+            self.command_fragment_buffer.append(" ")
+        elif key_name in ("BACK", "BACKSPACE") and self.command_fragment_buffer:
+            self.command_fragment_buffer.pop()
+
+    def command_fragment_match_reason(self):
+        if not self.command_fragment_detection or not self.command_fragment_signatures:
+            return ""
+
+        context = normalize_command_fragment("".join(self.command_fragment_buffer))
+        if not context:
+            return ""
+
+        for fragment in self.command_fragment_signatures:
+            if fragment in context:
+                safe_fragment = fragment.replace(" ", "_")[:48]
+                return "command_fragment:{}".format(safe_fragment)
+        return ""
+
+    def risk_increment_for_reason(self, reason):
+        if reason == "blacklisted_window":
+            return 100
+        if reason.startswith("pattern_match"):
+            return 80
+        if reason.startswith("command_fragment"):
+            return 50
+        if reason == "injected_burst":
+            return 70
+        if reason == "rapid_burst":
+            return 50
+        if reason == "low_variance_burst":
+            return 45
+        if reason == "low_entropy_timing":
+            return 45
+        if reason == "average_speed":
+            return 35
+        if reason == "injected_event":
+            return 20
+        if reason in ("rapid_sequence", "low_variance_sequence"):
+            return 15
+        if reason == "near_threshold_speed":
+            return 0
+        return 0
+
+    def update_risk_session(self, event_time, reasons):
+        if not self.risk_session_enabled:
+            self.last_risk_session_score = 0
+            self.last_risk_session_reasons = []
+            return ""
+
+        increment = sum(self.risk_increment_for_reason(reason) for reason in reasons)
+        if increment > 0:
+            self.risk_events.append((event_time, increment, tuple(reasons[:4])))
+
+        cutoff = event_time - self.risk_session_window_ms
+        while self.risk_events and self.risk_events[0][0] < cutoff:
+            self.risk_events.popleft()
+
+        total = sum(item[1] for item in self.risk_events)
+        merged_reasons = []
+        for _, _, item_reasons in self.risk_events:
+            for reason in item_reasons:
+                if reason != "sensitive_window" and reason not in merged_reasons:
+                    merged_reasons.append(reason)
+
+        self.last_risk_session_score = total
+        self.last_risk_session_reasons = merged_reasons[:6]
+
+        if total >= self.risk_session_threshold:
+            label = "+".join(self.last_risk_session_reasons[:3]) or "accumulated_evidence"
+            return "risk_session:{}".format(label)
+        return ""
+
+    def score_event_risk(self, event, pattern_reason, command_fragment_reason):
+        score = [0]
+        reasons = []
+
+        def add(points, reason):
+            score[0] += points
+            reasons.append(reason)
+
+        window_name = getattr(event, "WindowName", "") or ""
+        if self.is_window_blacklisted(window_name):
+            add(100, "blacklisted_window")
+        if self.is_sensitive_window(window_name):
+            add(25, "sensitive_window")
+        if command_fragment_reason:
+            add(55, command_fragment_reason)
+        if pattern_reason:
+            add(80, pattern_reason)
+        if getattr(event, "Injected", False):
+            add(35, "injected_event")
+
+        if self.low_entropy_counter >= self.timing_entropy_streak_count:
+            add(45, "low_entropy_timing")
+
+        if self.rapid_burst_count > 0:
+            if self.rapid_burst_counter >= self.rapid_burst_count:
+                add(55, "rapid_burst")
+            elif self.rapid_burst_counter >= max(3, self.rapid_burst_count // 2):
+                add(25, "rapid_sequence")
+
+        if self.injected_burst_count > 0 and self.injected_burst_counter >= self.injected_burst_count:
+            add(70, "injected_burst")
+
+        if self.low_variance_counter >= self.low_variance_streak_count:
+            add(50, "low_variance_burst")
+        elif self.low_variance_counter >= max(3, self.low_variance_streak_count // 2):
+            add(20, "low_variance_sequence")
+
+        if self.average_speed < self.active_threshold:
+            add(45, "average_speed")
+        elif self.average_speed < (self.active_threshold * 1.35):
+            add(20, "near_threshold_speed")
+
+        self.last_risk_score = score[0]
+        self.last_risk_reasons = reasons[:6]
+        session_reason = self.update_risk_session(int(getattr(event, "Time", 0)), reasons)
+
+        if self.risk_score_enabled and score[0] >= self.risk_score_threshold:
+            return "risk_score:{}".format("+".join(reasons[:3]))
+        return session_reason
+
     def in_warmup_phase(self):
         return self.warmup_events > 0 and self.total_events <= self.warmup_events
 
@@ -460,6 +760,11 @@ class DuckHunterHook:
             return True
         if reason.startswith("pattern_match"):
             return True
+        if reason.startswith(("risk_score", "risk_session")):
+            return any(
+                item.startswith(("blacklisted_window", "pattern_match", "command_fragment"))
+                for item in self.last_risk_reasons + self.last_risk_session_reasons
+            )
         return False
 
     def handle_warmup_intrusion(self, event, reason):
@@ -483,6 +788,7 @@ class DuckHunterHook:
         else:
             result = self.handle_intrusion(event, reason)
 
+        self.write_incident_json(event, result)
         self.record_decision(result, force_status=True)
         return result
 
@@ -534,9 +840,74 @@ class DuckHunterHook:
             "adaptive_samples": len(self.baseline_intervals),
             "low_variance_detection": self.low_variance_detection,
             "low_variance_streak": self.low_variance_counter,
+            "timing_entropy_detection": self.timing_entropy_detection,
+            "timing_entropy": round(self.timing_entropy, 3),
+            "low_entropy_streak": self.low_entropy_counter,
+            "command_fragment_detection": self.command_fragment_detection,
+            "risk_score_enabled": self.risk_score_enabled,
+            "risk_score_threshold": self.risk_score_threshold,
+            "last_risk_score": self.last_risk_score,
+            "last_risk_reasons": list(self.last_risk_reasons),
+            "risk_session_enabled": self.risk_session_enabled,
+            "risk_session_threshold": self.risk_session_threshold,
+            "last_risk_session_score": self.last_risk_session_score,
+            "last_risk_session_reasons": list(self.last_risk_session_reasons),
+            "current_normal_lockout_ms": self.current_normal_lockout_ms,
             "warmup_events": self.warmup_events,
             "warmup_remaining_events": max(0, self.warmup_events - self.total_events),
         }
+
+    def compute_normal_lockout_ms(self, event_time):
+        if not self.normal_lockout_backoff_enabled or self.normal_lockout_ms <= 0:
+            self.current_normal_lockout_ms = self.normal_lockout_ms
+            return self.current_normal_lockout_ms
+
+        cutoff = event_time - self.normal_lockout_backoff_window_ms
+        while self.recent_intrusion_times and self.recent_intrusion_times[0] < cutoff:
+            self.recent_intrusion_times.popleft()
+        self.recent_intrusion_times.append(event_time)
+
+        streak = max(1, len(self.recent_intrusion_times))
+        duration = self.normal_lockout_ms * (self.normal_lockout_backoff_multiplier ** (streak - 1))
+        self.current_normal_lockout_ms = int(min(self.normal_lockout_max_ms, max(self.normal_lockout_ms, duration)))
+        return self.current_normal_lockout_ms
+
+    def write_incident_json(self, event, allowed):
+        if not self.incident_json_filename:
+            return
+
+        payload = {
+            "timestamp_epoch_ms": int(time.time() * 1000),
+            "event_time_ms": int(getattr(event, "Time", 0)),
+            "policy": self.policy,
+            "action": "allowed" if allowed else "blocked",
+            "reason": self.last_intrusion_reason,
+            "key": getattr(event, "Key", ""),
+            "injected": bool(getattr(event, "Injected", False)),
+            "average_speed_ms": round(self.average_speed, 2),
+            "interval_stddev_ms": round(self.interval_stddev, 3),
+            "timing_entropy": round(self.timing_entropy, 3),
+            "threshold_ms": self.threshold,
+            "active_threshold_ms": self.active_threshold,
+            "risk_score": self.last_risk_score,
+            "risk_reasons": list(self.last_risk_reasons),
+            "risk_session_score": self.last_risk_session_score,
+            "risk_session_reasons": list(self.last_risk_session_reasons),
+            "rapid_streak": self.rapid_burst_counter,
+            "injected_streak": self.injected_burst_counter,
+            "low_variance_streak": self.low_variance_counter,
+            "low_entropy_streak": self.low_entropy_counter,
+            "normal_lockout_ms": self.current_normal_lockout_ms,
+        }
+        if self.incident_json_include_window:
+            payload["window"] = getattr(event, "WindowName", "")
+
+        try:
+            with open(self.incident_json_filename, "a") as incident_file:
+                json.dump(payload, incident_file, sort_keys=True)
+                incident_file.write("\n")
+        except Exception as exc:
+            logging.exception("Unable to write incident JSON file %r: %s", self.incident_json_filename, exc)
 
     def pause_protection(self, duration_ms=None):
         duration = duration_ms if duration_ms is not None else self.pause_duration_ms
@@ -555,10 +926,15 @@ class DuckHunterHook:
         self.last_intrusion_key = event.Key or ""
         self.last_intrusion_at_ms = int(time.time() * 1000)
 
+        if self.policy == "normal":
+            lockout_ms = self.compute_normal_lockout_ms(int(event.Time))
+        else:
+            lockout_ms = self.current_normal_lockout_ms
+
         self.log_intrusion(event, reason)
 
         if self.policy == "normal":
-            self.normal_block_until = int(event.Time) + self.normal_lockout_ms
+            self.normal_block_until = int(event.Time) + lockout_ms
             self.log_event(event)
             return False
 
@@ -635,6 +1011,10 @@ class DuckHunterHook:
             return result
 
         if self.prev_time == -1:
+            key_name = normalize_key_name(event.Key)
+            if key_name:
+                self.key_buffer.append(key_name)
+            self.update_command_context(event)
             self.prev_time = event_time
             self.record_decision(True)
             return True
@@ -642,6 +1022,7 @@ class DuckHunterHook:
         interval = max(0, event_time - self.prev_time)
         self.prev_time = event_time
         self.update_interval_metrics(interval)
+        self.update_entropy_metrics(interval)
 
         if interval <= self.rapid_burst_interval:
             self.rapid_burst_counter += 1
@@ -656,6 +1037,7 @@ class DuckHunterHook:
         key_name = normalize_key_name(event.Key)
         if key_name:
             self.key_buffer.append(key_name)
+        self.update_command_context(event)
 
         self.effective_threshold = self.compute_effective_threshold()
         threshold_override = self.get_window_threshold_override(window_name)
@@ -670,9 +1052,26 @@ class DuckHunterHook:
         else:
             self.low_variance_counter = 0
 
+        pattern_reason = self.pattern_match_reason()
+        command_fragment_reason = self.command_fragment_match_reason()
+
+        if (
+            event.Injected and
+            self.allow_auto and
+            not self.is_window_blacklisted(window_name) and
+            (self.injected_burst_count <= 0 or self.injected_burst_counter < self.injected_burst_count) and
+            not pattern_reason and
+            not command_fragment_reason
+        ):
+            self.record_decision(True)
+            return True
+
+        risk_reason = self.score_event_risk(event, pattern_reason, command_fragment_reason)
+
         self.debug_log(
             "event key=%r injected=%r interval=%d avg=%.2f stddev=%.3f "
-            "rapid=%d injected_streak=%d low_variance=%d effective=%d active=%d",
+            "rapid=%d injected_streak=%d low_variance=%d effective=%d active=%d "
+            "entropy=%.3f low_entropy=%d risk=%d session_risk=%d risk_reasons=%s",
             event.Key,
             event.Injected,
             interval,
@@ -683,18 +1082,15 @@ class DuckHunterHook:
             self.low_variance_counter,
             self.effective_threshold,
             self.active_threshold,
+            self.timing_entropy,
+            self.low_entropy_counter,
+            self.last_risk_score,
+            self.last_risk_session_score,
+            "|".join(self.last_risk_reasons),
         )
 
         if self.is_window_blacklisted(window_name):
             return self.trigger_intrusion(event, "blacklisted_window")
-
-        if (
-            event.Injected and
-            self.allow_auto and
-            (self.injected_burst_count <= 0 or self.injected_burst_counter < self.injected_burst_count)
-        ):
-            self.record_decision(True)
-            return True
 
         if self.rapid_burst_count > 0 and self.rapid_burst_counter >= self.rapid_burst_count:
             return self.trigger_intrusion(event, "rapid_burst")
@@ -705,9 +1101,11 @@ class DuckHunterHook:
         if self.low_variance_counter >= self.low_variance_streak_count:
             return self.trigger_intrusion(event, "low_variance_burst")
 
-        pattern_reason = self.pattern_match_reason()
         if pattern_reason:
             return self.trigger_intrusion(event, pattern_reason)
+
+        if risk_reason:
+            return self.trigger_intrusion(event, risk_reason)
 
         if self.average_speed < self.active_threshold:
             return self.trigger_intrusion(event, "average_speed")
@@ -826,7 +1224,8 @@ class DuckHunterGUI(BaseWindowMixin):
         btn_log.grid(column=2, row=0, padx=5, pady=8)
         btn_close.grid(column=3, row=0, padx=5, pady=8)
 
-        summary = "Policy: {} | Base threshold: {}ms".format(POLICY, THRESHOLD)
+        risk_state = "on/{}".format(RISK_SCORE_THRESHOLD) if RISK_SCORE_ENABLED else "off"
+        summary = "Policy: {} | Base threshold: {}ms | Risk: {}".format(POLICY, THRESHOLD, risk_state)
         policy_label = Label(self.window, text=summary)
         policy_label.grid(column=0, row=1, columnspan=4, pady=(0, 6))
 
@@ -900,7 +1299,7 @@ class DuckHunterControlWindow(BaseWindowMixin):
         btn_pause.grid(column=4, row=0, padx=5, pady=8)
         btn_resume.grid(column=5, row=0, padx=5, pady=8)
 
-        self.status_label = Label(self.window, text="Status: active")
+        self.status_label = Label(self.window, text="Status: active", anchor="w", justify="left", wraplength=500)
         self.status_label.grid(column=0, row=1, columnspan=6, pady=(0, 6))
 
     def start_hook_async(self):
@@ -934,6 +1333,15 @@ class DuckHunterControlWindow(BaseWindowMixin):
             text += " | Pause left: {}ms".format(status["pause_remaining_ms"])
         if status["warmup_remaining_events"] > 0:
             text += " | Warmup left: {} ev".format(status["warmup_remaining_events"])
+        if status["last_risk_score"] > 0:
+            text += " | Risk: {}/{}".format(status["last_risk_score"], status["risk_score_threshold"])
+        if status["last_risk_session_score"] > 0:
+            text += " | Session: {}/{}".format(
+                status["last_risk_session_score"],
+                status["risk_session_threshold"],
+            )
+        if status["low_entropy_streak"] > 0:
+            text += " | Entropy: {}".format(status["timing_entropy"])
         if status["last_intrusion_reason"]:
             text += " | Last: {}".format(status["last_intrusion_reason"])
         self.status_label.config(text=text)
